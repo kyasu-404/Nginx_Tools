@@ -1,6 +1,17 @@
 # Nginx Tools
 
-Две утилиты для работы с Nginx. `update-symlinks.sh` управляет включёнными конфигурациями сайтов, а `nginx_log_analyzer.py` строит отчёты по access- и error-логам.
+Утилиты для управления сайтами Nginx, проверки доступности и диагностики.
+
+| Скрипт | Для чего нужен |
+|---|---|
+| `update-symlinks.sh` | Включить сайты через `sites-enabled`, проверить конфигурацию и выполнить reload. |
+| `nginx-check.py` | Проверить HTTP-статусы, редиректы и время ответа по списку URL. |
+| `nginx-vhosts.py` | Найти конфиг виртуального хоста, его адреса, порты и upstream. |
+| `nginx-cert-check.py` | Проверить TLS-сертификат, срок действия и совпадение с PEM-файлом. |
+| `nginx-config-diff.py` | Сохранить снимок конфигурации и сравнить его с другим снимком или файлами на сервере. |
+| `nginx_log_analyzer.py` | Разобрать access- и error-логи, посчитать ошибки и оценить задержки. |
+
+Храните `nginx-vhosts.py`, `nginx-config-diff.py` и `_nginx_config.py` в одном каталоге. Для новых Python-утилит используйте Python 3.11 или новее. Все зависимости Python входят в стандартную библиотеку.
 
 ## Управление конфигурациями сайтов
 
@@ -28,6 +39,77 @@ sudo bash update-symlinks.sh --all
 
 Для reload скрипт использует активную службу `nginx` через `systemctl`. Если такой службы нет, он ищет запущенный процесс через `pgrep` из procps и использует `nginx -s reload`. При остановленном Nginx выполняется только проверка конфигурации.
 
+## Проверка HTTP и времени ответа
+
+`nginx-check.py` принимает TOML со списком проверок. Нужен curl 7.70 или новее в `PATH`. Запускать можно с сервера или с рабочего компьютера, например до и после изменения конфигурации.
+
+~~~toml
+[[check]]
+name = "Nextcloud через обычный DNS"
+url = "https://cloud.example.org/status.php"
+status = 200
+
+[[check]]
+name = "Nextcloud на новом сервере"
+url = "https://cloud.example.org/status.php"
+connect_ip = "192.0.2.10"
+status = 200
+timeout = 5
+
+[[check]]
+name = "Редирект на HTTPS"
+url = "http://cloud.example.org/"
+status = [301, 308]
+location = "https://cloud.example.org/"
+~~~
+
+~~~bash
+python3 nginx-check.py checks.toml
+python3 nginx-check.py checks.toml --json
+~~~
+
+По умолчанию запрос выполняется методом GET, ожидается HTTP 200, таймаут составляет 10 секунд. Можно задать `method = "HEAD"`, ожидаемый статус или список статусов и, для частного CA, `ca_file = "ca.pem"`. Относительный путь к CA считается от каталога TOML.
+
+Утилита подключается напрямую с собственными настройками curl. С `connect_ip` адрес меняется только для указанной проверки. Имя из URL сохраняется для Host, TLS SNI и проверки сертификата. `location` сравнивается с адресом редиректа в первом ответе. DNS, TCP и TLS показаны как длительности отдельных этапов, TTFB измеряется от начала запроса до первого байта. Код завершения `0` означает успех всех проверок, `1` означает сбой проверки, `2` означает ошибку запуска или формата.
+
+## Просмотр виртуальных хостов
+
+`nginx-vhosts.py` читает `nginx -T` и показывает HTTP-блоки `server`, источник с номером строки, `listen`, `server_name` и назначения `proxy_pass`, `fastcgi_pass`, `grpc_pass` и других backend-директив. Отдельные таблицы показывают upstream-группы и выбор сервера по умолчанию для явно заданных сокетов. Учитываются вложенные `include` и шаблоны включения файлов. Формат `--json` удобен для обработки результата другими программами.
+
+~~~bash
+sudo python3 nginx-vhosts.py
+(umask 077; sudo nginx -T > nginx-dump.txt)
+python3 nginx-vhosts.py --dump nginx-dump.txt --json
+~~~
+
+Результат описывает конфигурацию на диске. Для живого запуска можно указать `--nginx`, `--config` и `--prefix`. В дампе учитывается порядок загрузки конфигов. Имена слушающих сокетов выводятся как заданы, без DNS-разрешения. При отсутствии `listen` показывается неявный сокет.
+
+## Проверка TLS-сертификатов
+
+`nginx-cert-check.py` подключается к указанным хостам и проверяет имя и цепочку доверия. По умолчанию предупреждает, если до окончания действия осталось меньше 30 дней. `--connect` позволяет указать другой IP, сохранив имя для SNI. `--cert-file` сравнивает SHA-256 полученного сертификата с первым сертификатом из локального PEM-файла, например `fullchain.pem`.
+
+~~~bash
+python3 nginx-cert-check.py cloud.example.org moodle.example.org --days 21
+python3 nginx-cert-check.py cloud.example.org --connect 192.0.2.10 --cert-file fullchain.pem
+python3 nginx-cert-check.py internal.example.org --ca-file internal-ca.pem --port 8443 --json
+~~~
+
+Код завершения `0` означает успешную проверку всех хостов. Утилита возвращает `1` при ошибке TLS, близком истечении срока или расхождении с PEM-файлом и `2` при ошибке аргументов или локального файла.
+
+## Снимки и сравнение конфигурации
+
+`nginx-config-diff.py` сравнивает содержимое файлов по секциям из `nginx -T` и показывает добавленные, удалённые и изменённые файлы. Снимки создаются с доступом только для владельца на Linux. Храните их в закрытом каталоге, поскольку в дампе могут оказаться секреты из конфигурации.
+
+~~~bash
+sudo python3 nginx-config-diff.py snapshot before.nginx
+sudo python3 nginx-config-diff.py diff before.nginx
+sudo python3 nginx-config-diff.py snapshot after.nginx
+sudo python3 nginx-config-diff.py diff before.nginx after.nginx
+python3 nginx-config-diff.py snapshot copy.nginx --dump nginx-dump.txt
+~~~
+
+`snapshot` создаёт новый файл. `diff` с одним снимком сравнивает его с файлами, которые читает текущий `nginx -T`. С двумя снимками Nginx для сравнения не требуется. Для живого чтения доступны `--nginx`, `--config` и `--prefix`. Код завершения `0` означает отсутствие различий, `1` означает, что файлы отличаются, `2` означает ошибку.
+
 ## Анализ логов
 
 `nginx_log_analyzer.py` использует стандартную библиотеку Python 3. Для запуска нужны права на чтение логов. Без пути открывается меню с файлами из `/var/log/nginx`. Для другого каталога меню передайте `--log-dir`.
@@ -36,7 +118,7 @@ sudo bash update-symlinks.sh --all
 python3 nginx_log_analyzer.py
 python3 nginx_log_analyzer.py /var/log/nginx/access.log
 python3 nginx_log_analyzer.py /var/log/nginx/error.log.2.gz --type error
-python3 nginx_log_analyzer.py /var/log/nginx/access-json.log --type json
+python3 nginx_log_analyzer.py /var/log/nginx/access-json.log --type json --since 2h
 python3 nginx_log_analyzer.py /var/log/nginx/access.log --tail
 ~~~
 
@@ -44,12 +126,18 @@ python3 nginx_log_analyzer.py /var/log/nginx/access.log --tail
 
 Отчёт по access-логам показывает коды ответа, количество `4xx` и `5xx`, популярные IP и пути, частые `404`, User-Agent с признаками ботов и пути, совпавшие с подозрительными шаблонами. Параметры запроса исключаются из рейтингов URI и `404`. Каждая строка добавляет максимум одно срабатывание в `SUSPICIOUS`. Эти совпадения предназначены для ручной проверки. Отчёт по error-логам группирует строки по уровню и сообщению. Оба отчёта показывают количество пропущенных строк. Счётчики точные, поэтому расход памяти зависит от числа уникальных ключей в логе.
 
+### Фильтр по времени и задержки
+
+`--since` включает записи начиная с указанного времени. Можно задать интервал от момента запуска (`30m`, `2h`, `7d`) или ISO 8601 с часовым поясом, например `2026-11-21T09:00:00+03:00`. Для error-логов и аргументов без пояса используется локальный часовой пояс. Для JSON нужен `time`. Записи без корректного времени считаются отдельно при включённом фильтре. В режиме `--tail` граница фиксируется при запуске, а чтение начинается с новых записей.
+
+Если JSON содержит поля времени, отчёт показывает число замеров, p50 и p95 в миллисекундах по всем запросам, по путям и по адресам upstream. Для путей и upstream выводится до десяти строк с наибольшим p95. Процентили вычисляются по ближайшему рангу. При повторных попытках каждое значение времени ответа сопоставляется с адресом своей попытки, а ошибки upstream показываются отдельно.
+
 ### Формат JSON Lines
 
-Одна строка содержит один объект. Обязательны строковые `ip` и `uri`, а также `status` из трёх цифр в виде числа или строки. Поле `agent` может быть строкой, `null` или отсутствовать.
+Одна строка содержит один объект. Обязательны строковые `ip` и `uri`, а также `status` из трёх цифр в виде числа или строки. Поле `agent` может быть строкой, `null` или отсутствовать. Поля времени и upstream используются при наличии.
 
 ~~~json
-{"ip":"192.0.2.10","uri":"/api/health?verbose=1","status":200,"agent":"curl/8.0"}
+{"ip":"192.0.2.10","uri":"/api/health?verbose=1","status":200,"agent":"curl/8.0","time":"2026-11-21T09:00:00+03:00","request_time":"0.020","upstream_addr":"127.0.0.1:8080","upstream_response_time":"0.014","upstream_status":"200"}
 ~~~
 
 Пример настроек Nginx для секции `http`. Директиву `access_log` можно также задать для конкретного сервера.
@@ -57,7 +145,9 @@ python3 nginx_log_analyzer.py /var/log/nginx/access.log --tail
 ~~~nginx
 log_format tools_json escape=json
     '{"ip":"$remote_addr","uri":"$request_uri",'
-    '"status":"$status","agent":"$http_user_agent"}';
+    '"status":"$status","agent":"$http_user_agent","time":"$time_iso8601",'
+    '"request_time":"$request_time","upstream_addr":"$upstream_addr",'
+    '"upstream_response_time":"$upstream_response_time","upstream_status":"$upstream_status"}';
 
 access_log /var/log/nginx/access-json.log tools_json;
 ~~~
